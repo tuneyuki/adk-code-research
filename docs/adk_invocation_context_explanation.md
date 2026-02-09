@@ -1,50 +1,52 @@
-# InvocationContext コードレベル解析
+# ADKにおける呼び出しコンテキストと履歴管理
 
-`InvocationContext` は、Agent の**1回の実行単位（Invocation）**における「すべて」を保持する巨大なコンテナオブジェクトです。
-ソースコード (`google.adk.agents.invocation_context`) に基づき、その役割と主要プロパティを解説します。
+## 概要
+本文書では、ADKの `session_service` が会話履歴をどのように管理し、エージェント実行時にコンテキストウィンドウがどのように扱われるかについて説明します。
 
-## 1. 役割: 実行状態の「中心地」
+## セッションサービス (Session Service)
+`session_service` は会話履歴の保存と取得を担当します。
+- **実装 (Implementations)**:
+    - `InMemorySessionService`: イベントをメモリ内に保存します。再起動すると失われます。
+    - `SqliteSessionService`: イベントをローカルの SQLite データベースに保存します。
+- **保存制限 (Storage Limits)**:
+    - どちらの実装も、保存されるイベントの**数**に対してデフォルトの制限を設けていません。手動で管理しない限り、履歴は無制限に増加します。
+- **取得 (Retrieval)**:
+    - 取得メソッド (`get_session`) は `num_recent_events` (最新のN件) や `after_timestamp` (特定の時間以降) によるフィルタリングをサポートしています。
+    - しかし、デフォルトのフロー (`contents.py`) では、現在のブランチの**全**履歴を取得し、「不可視」や不要なイベント（フレームワークイベントなど）のみをフィルタリングします。
 
-Runner が `run_async` されたとき、最初に生成されるのがこのオブジェクトです。
-Agent やツール、プラグインは、すべてこの Context を通じて必要な情報にアクセスします。
+## コンテキストウィンドウの扱いと機能の所在
+ここでの機能が「ADKのコードで実行されるもの」なのか、「Google Cloud側で実行されるもの」なのかを整理します。
 
-**主な責任:**
-1.  **サービスの提供**: DBやファイル操作など、外部連携機能へのアクセス権を提供します。
-2.  **実行スコープの定義**: 現在「誰が（User/Agent）」「どのセッションで」「何をしているか」を定義します。
-3.  **状態の保持**: 各 Agent のメモリ状態 (`agent_states`) や、終了フラグ (`end_invocation`) を管理します。
+### 1. コンパクション (Compaction) - ADKの機能 (ただし自動化は未実装)
+- **機能の所在**: **ADK (クライアントサイド)**
+- **仕組み**:
+    - ADKには、会話履歴の中に「要約イベント (Compaction Event)」が含まれている場合、それより古いイベントを無視して、要約イベント以降のみをLLMに送信するロジック (`contents.py`) が実装されています。
+    - **注意点**: しかし、自動的に古い履歴を要約してこのイベントを作成する機能（例: トークン数が一定を超えたら要約エージェントを呼ぶ等）は、ADKの標準フローには含まれていません。
+    - **結論**: 仕組みはありますが、実際に要約を行うにはユーザー自身でロジックを組む必要があります。Google Cloudの特定の機能には依存していません。
 
-## 2. 主要プロパティ (Source Code Based)
+### 2. Live API (`run_live`) - Google Cloudの機能
+- **機能の所在**: **Google Cloud (Vertex AI / Gemini API)**
+- **仕組み**:
+    - `RunConfig` で `context_window_compression` を設定すると、ADKはその設定をそのまま Google Cloud の API に渡します。
+    - 実際の圧縮処理は、Google Cloud のサーバー側で行われます。
+    - **結論**: Google Cloud の機能に依存しています。
 
-クラス定義 (`class InvocationContext(BaseModel)`) から見る主要な構成要素です。
+### 3. Interactions API (`use_interactions_api=True`) - Google Cloudの機能
+- **機能の所在**: **Google Cloud (Vertex AI / Gemini API)**
+- **仕組み**:
+    - ADKは全履歴を送る代わりに、前回のやり取りを示すID (`previous_interaction_id`) だけを送信します。
+    - 会話の履歴や状態（ステート）の管理は、すべて Google Cloud のサーバー側で行われます。
+    - **結論**: Google Cloud の機能に依存しています。
 
-### A. サービス連携 (Services)
-Agent が外部とやり取りするためのインターフェース群です。
-*   `session_service`: 会話履歴の保存・読み込み。
-*   `artifact_service`: 生成ファイル（画像やPDFなど）の保存。
-*   `memory_service`: 長期記憶の検索。
-*   `plugin_manager`: 拡張機能（フック処理）の管理。
+## 推奨事項
+コンテキストウィンドウの制限（トークン制限）を回避するための現実的なアプローチは以下の通りです：
 
-### B. 実行パラメータ (Execution Scope)
-*   `invocation_id`: この実行を一意に識別するID（UUID）。再開時にも使用。
-*   `session`: 現在のセッションオブジェクト全体。
-*   `user_content`: 今回の実行のトリガーとなったユーザーメッセージ。
-*   `agent`: 現在実行中の Agent インスタンス。
-*   `run_config`: 実行時の設定（LLM呼び出し上限など）。
+1.  **Interactions API の使用 (推奨)**:
+    - 最も簡単にコンテキストを管理できます。履歴管理を Google Cloud に任せるため、ADK側での複雑な実装が不要です。
+    - `Gemini` モデル設定で `use_interactions_api=True` を有効にします。
 
-### C. 実行制御 (Control Flow)
-*   `agent_states`: 各 Agent の内部状態を保持する辞書。Resume 時にここから復元されます。
-    *   型: `dict[str, dict[str, Any]]` (Agent名をキーとした状態辞書)
-*   `end_of_agents`: 各 Agent が「完了」したかどうかを管理するフラグ。
-*   `end_invocation`: **重要**。これを `True` にセットすると、Agent のループが強制終了します（プラグイン等から制御可能）。
+2.  **Live API の使用**:
+    - 音声対話などリアルタイム性が求められる場合はこちらを使用し、必要に応じて圧縮設定を有効にします。
 
-## 3. 具体的な動作イメージ
-
-`Runner.run_async` 内部での `InvocationContext` のライフサイクルは以下のようになります。
-
-1.  **生成**: `Runner._new_invocation_context()` で初期化されます。ここでサービス類が注入されます。
-2.  **伝播**: Agent の `run_async(ctx)` メソッドの引数として渡されます。
-3.  **参照・更新**:
-    *   Agent は `ctx.session` から過去の会話を読みます。
-    *   ツールは `ctx.artifact_service` を使ってファイルを保存します。
-    *   `ctx.agent_states` が更新され、ステップごとの思考状態が記録されます。
-4.  **破棄**: 実行（Invocation）が完了すると、この Context オブジェクトの役割は終わりますが、変更された内容は `SessionService` を通じて永続化されます。
+3.  **手動管理 (上級者向け)**:
+    - 独自の `SessionService` を実装して古い履歴を削除・アーカイブするか、独自のエージェントを作成して定期的に履歴を要約し、`Compaction` イベントを履歴に挿入するような仕組みを構築します。
