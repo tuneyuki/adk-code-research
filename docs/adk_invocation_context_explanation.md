@@ -19,10 +19,19 @@
 
 ### 1. コンパクション (Compaction) - ADKの機能 (ただし自動化は未実装)
 - **機能の所在**: **ADK (クライアントサイド)**
-- **仕組み**:
-    - ADKには、会話履歴の中に「要約イベント (Compaction Event)」が含まれている場合、それより古いイベントを無視して、要約イベント以降のみをLLMに送信するロジック (`contents.py`) が実装されています。
-    - **注意点**: しかし、自動的に古い履歴を要約してこのイベントを作成する機能（例: トークン数が一定を超えたら要約エージェントを呼ぶ等）は、ADKの標準フローには含まれていません。
-    - **結論**: 仕組みはありますが、実際に要約を行うにはユーザー自身でロジックを組む必要があります。Google Cloudの特定の機能には依存していません。
+- **ソースコードの事実 (Source Level Facts)**:
+    - **消費ロジック**: `google/adk/flows/llm_flows/contents.py` の `_process_compaction_events` 関数に実装されています。履歴内に `compaction` アクションを持つイベントが見つかると、その `start_timestamp` 以前のイベントをフィルタリングして除外します。
+    ```python
+    # contents.py (抜粋イメージ)
+    def _process_compaction_events(events: list[Event]) -> list[Event]:
+      # ...
+      for event in reversed(events):
+        if event.actions and event.actions.compaction:
+           # 要約イベントが見つかったら、それより古いイベントをフィルタリング対象にする
+           last_compaction_start_time = min(last_compaction_start_time, compaction.start_timestamp)
+    ```
+    - **生成ロジック**: ADKの標準ライブラリ内 (`google/adk` 配下) 全体を検索しましたが、`EventActions` の `compaction` フィールドに値を設定して新たなイベントを生成するコードは**存在しませんでした**（テストコードや定義部分を除く）。
+    - **結論**: 「要約された履歴を正しく処理する（消費する）」機能は実装されていますが、「履歴を要約してイベントを作る（生成する）」機能は、ユーザーが自分で実装する必要があります（スタブコードがあるわけではなく、単に呼び出し側が存在しない状態です）。
 
 ### 2. Live API (`run_live`) - Google Cloudの機能
 - **機能の所在**: **Google Cloud (Vertex AI / Gemini API)**
