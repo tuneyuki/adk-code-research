@@ -5,3 +5,5 @@
 uv.lock
 *.json
 .python-version
+faqdata
+*.txt
